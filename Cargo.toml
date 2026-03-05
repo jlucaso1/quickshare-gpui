@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+log = { version = "0.4", features = ["release_max_level_info"] }
+rqs_lib = { path = "crates/core", features = ["experimental"] }
+rqs_settings = { path = "crates/settings" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.43", features = ["macros", "rt", "rt-multi-thread", "net", "sync", "time", "io-util"] }
+
+[profile.release]
+opt-level = "z"
+debug = false
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+incremental = false

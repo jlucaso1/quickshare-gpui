@@ -1,0 +1,11 @@
+[package]
+name = "rqs_settings"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+directories = "6.0"
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
