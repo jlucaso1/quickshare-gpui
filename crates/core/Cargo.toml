@@ -10,17 +10,18 @@ experimental = ["bluer", "btleplug"]
 allow-self-discovery = []
 
 [dependencies]
+aes = "0.8"
 anyhow = "1.0"
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 btleplug = { version = "0.11", optional = true }
 bytes = { version = "1.10", default-features = false }
+cbc = { version = "0.1", features = ["alloc"] }
 directories = "6.0"
 get_if_addrs = "0.5"
 gethostname = "1"
 hex = { version = "0.4", default-features = false, features = ["std"] }
 hkdf = "0.12"
 hmac = { version = "0.12", features = ["reset"] }
-libaes = "0.7"
 log = "0.4"
 mdns-sd = "0.18"
 mime_guess = { version = "2.0", default-features = false }

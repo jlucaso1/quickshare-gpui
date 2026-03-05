@@ -1,7 +1,10 @@
 use anyhow::anyhow;
 use bytes::Bytes;
+use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use hmac::{Hmac, Mac};
-use libaes::{Cipher, AES_256_KEY_LEN};
+
+type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 use p256::ecdh::diffie_hellman;
 use p256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
 use p256::{EncodedPoint, PublicKey};
@@ -58,8 +61,9 @@ pub struct InboundRequest {
     receiver: Receiver<ChannelMessage>,
     recv_buf: Vec<u8>,
     encode_buf: Vec<u8>,
-    encrypt_cipher: Option<Cipher>,
-    decrypt_cipher: Option<Cipher>,
+    frame_buf: Vec<u8>,
+    encrypt_key_aes: Option<[u8; 32]>,
+    decrypt_key_aes: Option<[u8; 32]>,
     send_hmac: Option<HmacSha256>,
     recv_hmac: Option<HmacSha256>,
 }
@@ -91,8 +95,9 @@ impl InboundRequest {
             receiver,
             recv_buf: Vec::new(),
             encode_buf: Vec::with_capacity(600 * 1024),
-            encrypt_cipher: None,
-            decrypt_cipher: None,
+            frame_buf: Vec::with_capacity(8 * 1024),
+            encrypt_key_aes: None,
+            decrypt_key_aes: None,
             send_hmac: None,
             recv_hmac: None,
         }
@@ -503,11 +508,11 @@ impl InboundRequest {
         &mut self,
         smsg: &SecureMessage,
     ) -> Result<(), anyhow::Error> {
-        let recv_hmac_key = self.state.recv_hmac_key.as_ref().unwrap();
-        let mut hmac = HmacSha256::new_from_slice(recv_hmac_key).map_err(|e| anyhow!("{e}"))?;
+        let hmac = self.recv_hmac.as_mut().unwrap();
+        Mac::reset(hmac);
         hmac.update(&smsg.header_and_body);
         if !hmac
-            .finalize()
+            .finalize_reset()
             .into_bytes()
             .as_slice()
             .eq(smsg.signature.as_slice())
@@ -517,13 +522,20 @@ impl InboundRequest {
 
         let header_and_body = HeaderAndBody::decode(&*smsg.header_and_body)?;
 
-        let msg_data = header_and_body.body;
+        let iv: [u8; 16] = header_and_body
+            .header
+            .iv()
+            .try_into()
+            .map_err(|_| anyhow!("Invalid IV length"))?;
+        let mut msg_data = header_and_body.body;
 
-        // Use cached cipher (avoids per-message key expansion)
-        let cipher = self.decrypt_cipher.as_ref().unwrap();
-        let decrypted = cipher.cbc_decrypt(header_and_body.header.iv(), &msg_data);
+        // Decrypt in-place (no allocation)
+        let key = self.decrypt_key_aes.as_ref().unwrap();
+        let decrypted = Aes256CbcDec::new(key.into(), &iv.into())
+            .decrypt_padded_mut::<Pkcs7>(&mut msg_data)
+            .map_err(|e| anyhow!("AES-CBC decrypt: {e}"))?;
 
-        let d2d_msg = DeviceToDeviceMessage::decode(&*decrypted)?;
+        let d2d_msg = DeviceToDeviceMessage::decode(decrypted)?;
 
         let seq = self.get_client_seq_inc();
         if d2d_msg.sequence_number() != seq {
@@ -1164,13 +1176,9 @@ impl InboundRequest {
         let server_key = hkdf_extract_expand(&key_salt, &d2d_server, "ENC:2".as_bytes(), 32)?;
         let server_hmac_key = hkdf_extract_expand(&key_salt, &d2d_server, "SIG:1".as_bytes(), 32)?;
 
-        // Cache ciphers to avoid per-message key expansion
-        self.encrypt_cipher = Some(Cipher::new_256(
-            &server_key[..AES_256_KEY_LEN].try_into().unwrap(),
-        ));
-        let mut dc = Cipher::new_256(&client_key[..AES_256_KEY_LEN].try_into().unwrap());
-        dc.set_auto_padding(true);
-        self.decrypt_cipher = Some(dc);
+        // Store raw AES keys — cbc creates encryptor/decryptor per-message with key+IV
+        self.encrypt_key_aes = Some(server_key[..32].try_into().unwrap());
+        self.decrypt_key_aes = Some(client_key[..32].try_into().unwrap());
 
         // Cache HMAC instances — use reset() per message instead of new_from_slice()
         self.send_hmac = Some(HmacSha256::new_from_slice(&server_hmac_key)?);
@@ -1280,24 +1288,39 @@ impl InboundRequest {
     async fn encrypt_and_send(&mut self, frame: &OfflineFrame) -> Result<(), anyhow::Error> {
         self.state.server_seq += 1;
 
+        // Encode frame into reusable frame_buf, then wrap in D2D message
+        self.frame_buf.clear();
+        frame.encode(&mut self.frame_buf)?;
+
         let d2d_msg = DeviceToDeviceMessage {
             sequence_number: Some(self.state.server_seq),
-            message: Some(frame.encode_to_vec()),
+            message: Some(std::mem::take(&mut self.frame_buf)),
         };
 
         // Encode D2D message into reusable buffer
         self.encode_buf.clear();
         d2d_msg.encode(&mut self.encode_buf)?;
+        // Reclaim the Vec from d2d_msg.message to reuse as frame_buf
+        self.frame_buf = d2d_msg.message.unwrap_or_default();
 
         let iv: [u8; 16] = rand::rng().random();
 
-        // Use cached cipher (avoids per-message key expansion)
-        let cipher = self.encrypt_cipher.as_ref().unwrap();
-        let encrypted = cipher.cbc_encrypt(&iv, &self.encode_buf);
+        // Encrypt in-place (no allocation for ciphertext)
+        let pt_len = self.encode_buf.len();
+        self.encode_buf.resize(pt_len + 16, 0); // room for PKCS7 padding
+        let key = self.encrypt_key_aes.as_ref().unwrap();
+        let ct_len = Aes256CbcEnc::new(key.into(), &iv.into())
+            .encrypt_padded_mut::<Pkcs7>(&mut self.encode_buf, pt_len)
+            .map_err(|e| anyhow!("AES-CBC encrypt: {e}"))?
+            .len();
+        self.encode_buf.truncate(ct_len);
 
-        // Build HeaderAndBody in-place, encode into reusable buffer
+        // Swap ciphertext to frame_buf, freeing encode_buf for HeaderAndBody encoding
+        std::mem::swap(&mut self.encode_buf, &mut self.frame_buf);
+
+        // Build HeaderAndBody, encode into reusable buffer
         let hb = HeaderAndBody {
-            body: encrypted,
+            body: std::mem::take(&mut self.frame_buf),
             header: Header {
                 encryption_scheme: EncScheme::Aes256Cbc.into(),
                 signature_scheme: SigScheme::HmacSha256.into(),
@@ -1308,11 +1331,13 @@ impl InboundRequest {
         };
         self.encode_buf.clear();
         hb.encode(&mut self.encode_buf)?;
+        self.frame_buf = hb.body; // reclaim buffer
 
-        let send_hmac_key = self.state.send_hmac_key.as_ref().unwrap();
-        let mut hmac = HmacSha256::new_from_slice(send_hmac_key).map_err(|e| anyhow!("{e}"))?;
+        // Use cached HMAC (avoids per-message key expansion + ipad/opad computation)
+        let hmac = self.send_hmac.as_mut().unwrap();
+        Mac::reset(hmac);
         hmac.update(&self.encode_buf);
-        let hmac_bytes = hmac.finalize().into_bytes();
+        let hmac_bytes = hmac.finalize_reset().into_bytes();
 
         let smsg = SecureMessage {
             header_and_body: std::mem::take(&mut self.encode_buf),
@@ -1320,8 +1345,6 @@ impl InboundRequest {
         };
 
         // Encode final SecureMessage into reusable buffer
-        // Note: smsg took ownership of encode_buf's contents via mem::take,
-        // so encode_buf is already empty
         smsg.encode(&mut self.encode_buf)?;
         let buf = std::mem::take(&mut self.encode_buf);
         self.send_frame(&buf).await?;

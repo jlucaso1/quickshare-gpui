@@ -3670,12 +3670,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a79a3332a6609480d7d0c9eab957bca6b455b91bb84e66d19f5ff66294b85b8"
 
 [[package]]
-name = "libaes"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82903360c009b816f5ab72a9b68158c27c301ee2c3f20655b55c5e589e7d3bb7"
-
-[[package]]
 name = "libc"
 version = "0.2.182"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5529,11 +5523,13 @@ checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 name = "rqs_lib"
 version = "0.11.5"
 dependencies = [
+ "aes",
  "anyhow",
  "base64",
  "bluer",
  "btleplug",
  "bytes",
+ "cbc",
  "directories",
  "env_logger",
  "get_if_addrs",
@@ -5541,7 +5537,6 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
- "libaes",
  "log",
  "mdns-sd",
  "mime_guess",
